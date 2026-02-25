@@ -13,6 +13,7 @@
     "express-session": "^1.19.0",
     "hpack": "^1.0.0",
     "socks": "^2.8.7",
+    "systeminformation": "^5.31.1",
     "telegraf": "^4.16.3"
   }
 }
