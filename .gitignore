@@ -1,0 +1,32 @@
+﻿# Dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+attacks.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Railway specific
+.railway/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+.env
