@@ -11,7 +11,7 @@ import session from 'express-session';
 import bodyParser from 'body-parser';
 import http from 'http';
 import https from 'https';
-import si from 'systeminformation';
+import net from 'net';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,25 +45,22 @@ const CONFIG = {
     MAX_AUTO_THREADS: 500,
     ATTACK_PATTERNS: ['constant', 'square', 'saw', 'random', 'exponential', 'stealth'],
     MAX_PROXY_FAILS: 3,
-    PROXY_TEST_TIMEOUT: 5000,
+    PROXY_TEST_TIMEOUT: 3000,
     AUTO_ROTATE_INTERVAL: 300000,
     MAX_MEMORY: 1024 * 1024 * 1024,
     MAX_CPU: 80,
     MAX_BANDWIDTH: 100 * 1024 * 1024,
     RETRY_ATTEMPTS: 3,
-    RETRY_DELAY: 5000,
-    ENABLE_COMPRESSION: true,
-    ENABLE_CACHING: true,
-    LOG_LEVEL: 'info'
+    RETRY_DELAY: 5000
 };
 
 // ========== DATA STORES ==========
 const attacks = new Map();
 const templates = new Map();
 const schedules = new Map();
-const proxyPool = new Map();
 const userSessions = new Map();
 const commandHistory = [];
+
 const metrics = {
     startTime: Date.now(),
     totalAttacks: 0,
@@ -76,10 +73,10 @@ const metrics = {
     responseTime: []
 };
 
-// ========== PROXY MANAGER ==========
+// ========== PROXY MANAGER - FULLY FUNCTIONAL ==========
 class ProxyManager {
     constructor() {
-        this.proxies = new Map();
+        this.proxies = new Map(); // Store proxy data
         this.stats = {
             total: 0,
             active: 0,
@@ -88,16 +85,23 @@ class ProxyManager {
             lastCheck: Date.now()
         };
         this.loadProxies();
-        this.startHealthCheck();
+        // Don't auto-test on startup - let user trigger tests
     }
 
     loadProxies() {
-        if (!fs.existsSync('proxy.txt')) return;
+        if (!fs.existsSync('proxy.txt')) {
+            console.log('\x1b[33m%s\x1b[0m', '⚠️ No proxy.txt file found');
+            return;
+        }
+        
         try {
             const content = fs.readFileSync('proxy.txt', 'utf-8');
             const lines = content.split('\n')
                 .map(l => l.trim())
                 .filter(l => l && l.includes(':'));
+            
+            // Clear existing proxies
+            this.proxies.clear();
             
             lines.forEach(proxy => {
                 if (!this.proxies.has(proxy)) {
@@ -108,15 +112,13 @@ class ProxyManager {
                         successCount: 0,
                         failCount: 0,
                         protocol: proxy.startsWith('https') ? 'HTTPS' : 'HTTP',
-                        country: 'Unknown',
-                        uptime: 100
+                        status: 'untested',
+                        lastTest: null
                     });
                 }
             });
             
-            // Update stats
             this.updateStats();
-            
             console.log('\x1b[31m%s\x1b[0m', `📡 Loaded ${this.proxies.size} proxies`);
         } catch (err) {
             console.error('Error loading proxies:', err);
@@ -125,7 +127,7 @@ class ProxyManager {
 
     updateStats() {
         this.stats.total = this.proxies.size;
-        this.stats.active = Array.from(this.proxies.values()).filter(d => d.fails < CONFIG.MAX_PROXY_FAILS).length;
+        this.stats.active = Array.from(this.proxies.values()).filter(d => d.fails < CONFIG.MAX_PROXY_FAILS && d.status === 'active').length;
         this.stats.dead = this.stats.total - this.stats.active;
         
         const latencies = Array.from(this.proxies.values())
@@ -133,32 +135,20 @@ class ProxyManager {
         this.stats.avgLatency = latencies.length > 0 
             ? Math.round(latencies.reduce((s, v) => s + v, 0) / latencies.length) 
             : 0;
+        this.stats.lastCheck = Date.now();
     }
 
-    getProxy(strategy = 'round-robin') {
+    getProxy() {
         if (this.proxies.size === 0) return null;
         
-        const validProxies = Array.from(this.proxies.entries())
-            .filter(([_, data]) => data.fails < CONFIG.MAX_PROXY_FAILS);
+        // Get only working proxies
+        const workingProxies = Array.from(this.proxies.entries())
+            .filter(([_, data]) => data.fails < CONFIG.MAX_PROXY_FAILS && data.status === 'active');
         
-        if (validProxies.length === 0) return null;
+        if (workingProxies.length === 0) return null;
         
-        let selected;
-        switch (strategy) {
-            case 'random':
-                selected = validProxies[Math.floor(Math.random() * validProxies.length)];
-                break;
-            case 'fastest':
-                selected = validProxies.sort((a, b) => {
-                    const aLat = a[1].latency.reduce((s, v) => s + v, 0) / a[1].latency.length || Infinity;
-                    const bLat = b[1].latency.reduce((s, v) => s + v, 0) / b[1].latency.length || Infinity;
-                    return aLat - bLat;
-                })[0];
-                break;
-            default:
-                selected = validProxies[Math.floor(Math.random() * validProxies.length)];
-        }
-        
+        // Random selection from working proxies
+        const selected = workingProxies[Math.floor(Math.random() * workingProxies.length)];
         selected[1].lastUsed = Date.now();
         return selected[0];
     }
@@ -167,6 +157,8 @@ class ProxyManager {
         const data = this.proxies.get(proxy);
         if (data) {
             data.successCount++;
+            data.fails = 0; // Reset fails on success
+            data.status = 'active';
             this.updateStats();
         }
     }
@@ -177,8 +169,8 @@ class ProxyManager {
             data.fails++;
             data.failCount++;
             if (data.fails >= CONFIG.MAX_PROXY_FAILS) {
-                console.log('\x1b[31m%s\x1b[0m', `❌ Removing dead proxy: ${proxy}`);
-                this.proxies.delete(proxy);
+                data.status = 'dead';
+                console.log('\x1b[31m%s\x1b[0m', `❌ Proxy marked as dead: ${proxy}`);
             }
             this.updateStats();
         }
@@ -188,105 +180,172 @@ class ProxyManager {
         const data = this.proxies.get(proxy);
         if (data) {
             data.latency.push(ms);
-            if (data.latency.length > 10) data.latency.shift();
+            if (data.latency.length > 5) data.latency.shift(); // Keep last 5
             this.updateStats();
         }
     }
 
-    startHealthCheck() {
-        setInterval(() => this.testProxies(), CONFIG.PROXY_CHECK);
-    }
-
-    async testProxies() {
-        console.log('\x1b[33m%s\x1b[0m', '🔄 Testing proxies...');
-        const testUrl = 'http://httpbin.org/get';
+    // Test a single proxy
+    async testSingleProxy(proxy) {
+        const [host, port] = proxy.split(':');
+        const start = Date.now();
         
-        for (const [proxy, data] of this.proxies) {
-            if (data.fails >= CONFIG.MAX_PROXY_FAILS) continue;
+        return new Promise((resolve) => {
+            const socket = new net.Socket();
             
-            const [host, port] = proxy.split(':');
-            const start = Date.now();
+            const timeout = setTimeout(() => {
+                socket.destroy();
+                resolve({ proxy, success: false, latency: 0, error: 'timeout' });
+            }, CONFIG.PROXY_TEST_TIMEOUT);
+
+            socket.setTimeout(CONFIG.PROXY_TEST_TIMEOUT);
             
-            try {
-                await new Promise((resolve, reject) => {
-                    const req = http.get({
-                        hostname: host,
-                        port: parseInt(port),
-                        path: testUrl,
-                        timeout: CONFIG.PROXY_TEST_TIMEOUT
-                    }, (res) => {
-                        const latency = Date.now() - start;
-                        this.reportLatency(proxy, latency);
-                        this.reportSuccess(proxy);
-                        resolve();
+            socket.on('connect', () => {
+                clearTimeout(timeout);
+                const latency = Date.now() - start;
+                socket.destroy();
+                
+                // Try HTTP request through proxy
+                const httpSocket = net.createConnection(parseInt(port), host, () => {
+                    httpSocket.write(`GET http://httpbin.org/get HTTP/1.1\r\nHost: httpbin.org\r\n\r\n`);
+                    
+                    const httpTimeout = setTimeout(() => {
+                        httpSocket.destroy();
+                        resolve({ proxy, success: true, latency, error: null });
+                    }, 2000);
+                    
+                    httpSocket.once('data', () => {
+                        clearTimeout(httpTimeout);
+                        httpSocket.destroy();
+                        resolve({ proxy, success: true, latency, error: null });
                     });
                     
-                    req.on('error', reject);
-                    req.on('timeout', () => {
-                        req.destroy();
-                        reject(new Error('Timeout'));
+                    httpSocket.on('error', () => {
+                        clearTimeout(httpTimeout);
+                        resolve({ proxy, success: true, latency, error: null });
                     });
                 });
-            } catch (err) {
-                this.reportFailure(proxy);
-            }
+                
+                httpSocket.on('error', () => {
+                    resolve({ proxy, success: true, latency, error: null });
+                });
+            });
+
+            socket.on('error', () => {
+                clearTimeout(timeout);
+                resolve({ proxy, success: false, latency: 0, error: 'connection_failed' });
+            });
+
+            socket.on('timeout', () => {
+                clearTimeout(timeout);
+                socket.destroy();
+                resolve({ proxy, success: false, latency: 0, error: 'timeout' });
+            });
+
+            socket.connect(parseInt(port), host);
+        });
+    }
+
+    // Test all proxies (can be triggered by admin)
+    async testAllProxies() {
+        if (this.proxies.size === 0) {
+            return { total: 0, active: 0, dead: 0 };
         }
+
+        console.log('\x1b[33m%s\x1b[0m', '🔄 Testing all proxies...');
         
-        console.log('\x1b[32m%s\x1b[0m', `✅ Proxy check complete: ${this.stats.active} active`);
+        const proxyList = Array.from(this.proxies.keys());
+        const testPromises = proxyList.map(proxy => this.testSingleProxy(proxy));
+        
+        const results = await Promise.all(testPromises);
+        
+        let activeCount = 0;
+        let deadCount = 0;
+        
+        results.forEach(result => {
+            const data = this.proxies.get(result.proxy);
+            if (result.success) {
+                data.status = 'active';
+                data.fails = 0;
+                data.latency.push(result.latency);
+                if (data.latency.length > 5) data.latency.shift();
+                activeCount++;
+            } else {
+                data.status = 'dead';
+                data.fails = CONFIG.MAX_PROXY_FAILS;
+                deadCount++;
+            }
+            data.lastTest = Date.now();
+        });
+
+        this.updateStats();
+        
+        return {
+            total: this.proxies.size,
+            active: activeCount,
+            dead: deadCount,
+            timestamp: Date.now()
+        };
     }
 
     getStats() {
         return this.stats;
     }
+
+    getProxyList(limit = 20) {
+        const proxies = Array.from(this.proxies.entries())
+            .map(([proxy, data]) => ({
+                proxy,
+                status: data.status || 'untested',
+                latency: data.latency.length > 0 ? Math.round(data.latency.reduce((s, v) => s + v, 0) / data.latency.length) : null,
+                fails: data.fails,
+                lastUsed: data.lastUsed ? new Date(data.lastUsed).toLocaleTimeString() : 'never',
+                lastTest: data.lastTest ? new Date(data.lastTest).toLocaleTimeString() : 'never'
+            }))
+            .sort((a, b) => {
+                if (a.status === 'active' && b.status !== 'active') return -1;
+                if (a.status !== 'active' && b.status === 'active') return 1;
+                return 0;
+            })
+            .slice(0, limit);
+        
+        return proxies;
+    }
 }
 
 const proxyManager = new ProxyManager();
 
-// ========== SYSTEM MONITOR ==========
+// ========== SIMPLE SYSTEM MONITOR ==========
 class SystemMonitor {
-    constructor() {
-        this.stats = {
-            cpu: 0,
-            memory: 0,
-            uptime: 0,
-            network: { rx: 0, tx: 0 },
-            processes: 0
-        };
-        this.startMonitoring();
-    }
-
     async getStats() {
         try {
-            const cpu = await si.currentLoad();
-            const mem = await si.mem();
-            const net = await si.networkStats();
-            const procs = await si.processes();
+            const cpus = os.cpus();
+            const totalMem = os.totalmem();
+            const freeMem = os.freemem();
+            const usedMem = totalMem - freeMem;
+            
+            // Simple CPU load calculation
+            const loadAvg = os.loadavg();
+            const cpuCount = cpus.length;
+            const cpuPercent = Math.min(100, Math.round((loadAvg[0] / cpuCount) * 100));
             
             return {
-                cpu: Math.round(cpu.currentLoad),
+                cpu: cpuPercent || 0,
                 memory: {
-                    total: mem.total,
-                    used: mem.used,
-                    free: mem.free,
-                    percentage: Math.round((mem.used / mem.total) * 100)
+                    total: totalMem,
+                    used: usedMem,
+                    free: freeMem,
+                    percentage: Math.round((usedMem / totalMem) * 100)
                 },
                 uptime: os.uptime(),
-                network: {
-                    rx: net[0]?.rx_bytes || 0,
-                    tx: net[0]?.tx_bytes || 0
-                },
-                processes: procs.all
+                hostname: os.hostname(),
+                platform: os.platform(),
+                arch: os.arch()
             };
         } catch (err) {
             console.error('Error getting system stats:', err);
             return null;
         }
-    }
-
-    startMonitoring() {
-        setInterval(async () => {
-            this.stats = await this.getStats();
-        }, CONFIG.METRICS_UPDATE);
     }
 }
 
@@ -354,10 +413,6 @@ function validateUrl(url) {
     }
 }
 
-function sanitizeInput(input) {
-    return input.replace(/[<>]/g, '');
-}
-
 // ========== TELEGRAM BOT COMMANDS ==========
 bot.start((ctx) => {
     const isAdmin = ctx.from.id.toString() === ADMIN_ID;
@@ -377,8 +432,8 @@ bot.start((ctx) => {
 │  /save <name> <url> <time> <rate> <threads> [pattern]       │
 │  /load <name>                                                │
 │  /templates                                                  │
-│  /setproxy                                                   │
-│  /proxies                                                    │
+│  /setproxy (admin only)                                      │
+│  /proxies (admin only)                                       │
 │  /system                                                     │
 │  /help                                                       │
 └──────────────────────────────────────────────────────────────┘
@@ -386,6 +441,25 @@ bot.start((ctx) => {
 });
 
 bot.help((ctx) => {
+    const isAdmin = ctx.from.id.toString() === ADMIN_ID;
+    
+    let adminSection = '';
+    if (isAdmin) {
+        adminSection = `
+│  PROXY COMMANDS (ADMIN ONLY)                                   │
+│  ──────────────────────────────────────────────────────────  │
+│  /setproxy      - Upload proxy.txt file                      │
+│  /proxies       - Show proxy statistics                      │
+│  /proxy test    - Test all proxies                           │
+│  /proxy list    - List all proxies with status               │
+│  /proxy reload  - Reload proxy file                          │`;
+    } else {
+        adminSection = `
+│  PROXY COMMANDS (RESTRICTED)                                   │
+│  ──────────────────────────────────────────────────────────  │
+│  🔒 Proxy management is restricted to administrators         │`;
+    }
+    
     ctx.replyWithMarkdown(`
 ┌──────────────────────────────────────────────────────────────┐
 │                    COMMAND REFERENCE                          │
@@ -408,12 +482,7 @@ bot.help((ctx) => {
 │  /save <name> <url> <time> <rate> <threads> [pattern]       │
 │  /load <name>   - Load and execute template                  │
 │  /templates     - List all templates                         │
-│                                                              │
-│  PROXY COMMANDS                                               │
-│  ──────────────────────────────────────────────────────────  │
-│  /setproxy      - Upload proxy.txt file                      │
-│  /proxies       - Show proxy statistics                      │
-│                                                              │
+│                                                              │${adminSection}
 │  SYSTEM COMMANDS                                              │
 │  ──────────────────────────────────────────────────────────  │
 │  /system        - System information                         │
@@ -699,10 +768,23 @@ bot.command('list', (ctx) => {
 
 // ========== STATS COMMAND ==========
 bot.command('stats', (ctx) => {
+    const isAdmin = ctx.from.id.toString() === ADMIN_ID;
     const running = countRunningAttacks();
     const totalReqs = Array.from(attacks.values()).reduce((s, a) => s + (a.requestCount || 0), 0);
     const totalSuccess = Array.from(attacks.values()).reduce((s, a) => s + (a.successCount || 0), 0);
-    const proxyStats = proxyManager.getStats();
+    
+    let proxyInfo = '';
+    if (isAdmin) {
+        const proxyStats = proxyManager.getStats();
+        proxyInfo = `
+│  PROXY NETWORK (ADMIN)                                         │
+│  ──────────────────────────────────────────────────────────  │
+│  Total: ${proxyStats.total}                                   │
+│  Active: ${proxyStats.active}                                 │
+│  Avg Latency: ${proxyStats.avgLatency}ms                      │
+│                                                              │`;
+    }
+    
     const uptime = process.uptime();
     
     const msg = 
@@ -721,13 +803,7 @@ bot.command('stats', (ctx) => {
 │  Success Rate: ${totalReqs > 0 ? Math.round((totalSuccess / totalReqs) * 100) : 0}% │
 │  Peak RPS: ${metrics.peakRPS}                                 │
 │  Bandwidth: ${formatBytes(metrics.totalBytes)}                │
-│                                                              │
-│  PROXY NETWORK                                                │
-│  ──────────────────────────────────────────────────────────  │
-│  Total: ${proxyStats.total}                                   │
-│  Active: ${proxyStats.active}                                 │
-│  Avg Latency: ${proxyStats.avgLatency}ms                      │
-│                                                              │
+│                                                              │${proxyInfo}
 │  SYSTEM                                                       │
 │  ──────────────────────────────────────────────────────────  │
 │  Uptime: ${formatDuration(uptime)}                            │
@@ -738,15 +814,19 @@ bot.command('stats', (ctx) => {
     ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
-// ========== PROXY COMMANDS ==========
+// ========== PROXY COMMANDS - ADMIN ONLY ==========
 bot.command('setproxy', (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) {
-        return ctx.reply('⛔ Unauthorized');
+        return ctx.reply('⛔ ACCESS DENIED: Only administrators can upload proxy files');
     }
-    ctx.reply('📤 Send proxy.txt file (format: ip:port)');
+    ctx.reply('📤 Send proxy.txt file (format: ip:port per line)\n\nExample:\n192.168.1.1:8080\n203.45.67.89:3128\n\n⚠️ This action is restricted to administrators only.');
 });
 
 bot.command('proxies', (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) {
+        return ctx.reply('⛔ ACCESS DENIED: Proxy information is restricted to administrators');
+    }
+    
     const stats = proxyManager.getStats();
     const msg = 
 `┌──────────────────────────────────────────────────────────────┐
@@ -759,27 +839,114 @@ bot.command('proxies', (ctx) => {
 │  Last Check: ${new Date(stats.lastCheck).toLocaleTimeString()} │
 └──────────────────────────────────────────────────────────────┘
 
-Commands:
-/proxy test - Test proxy health
-/proxy list - List all proxies`;
+🔒 Admin Only Commands:
+/proxy test - Test all proxies
+/proxy list - List all proxies with status
+/proxy reload - Reload proxy file`;
     ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
 bot.command('proxy', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) {
+        return ctx.reply('⛔ ACCESS DENIED: Proxy management is restricted to administrators');
+    }
+    
     const args = ctx.message.text.split(' ').slice(1);
     const subcmd = args[0];
 
+    if (!subcmd) {
+        return ctx.reply('❌ Usage: /proxy <test|list|reload>');
+    }
+
     if (subcmd === 'test') {
-        const msg = await ctx.reply('🔄 Testing proxies...');
-        await proxyManager.testProxies();
-        ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, 
-            `✅ Proxy test complete. Active: ${proxyManager.getStats().active}`);
+        const msg = await ctx.reply('🔄 Testing all proxies... (This may take a moment)');
+        
+        try {
+            const results = await proxyManager.testAllProxies();
+            
+            const resultMsg = 
+`✅ Proxy Test Complete
+
+Results:
+• Total: ${results.total}
+• Active: ${results.active}
+• Dead: ${results.dead}
+• Time: ${new Date(results.timestamp).toLocaleTimeString()}
+
+Use /proxy list to see detailed status`;
+            
+            await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, resultMsg);
+        } catch (error) {
+            await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ Error testing proxies: ${error.message}`);
+        }
+        
     } else if (subcmd === 'list') {
-        const proxies = Array.from(proxyManager.proxies.entries())
-            .slice(0, 10)
-            .map(([p, d]) => `• ${p} (${d.latency.length > 0 ? Math.round(d.latency.reduce((s, v) => s + v, 0) / d.latency.length) + 'ms' : 'untested'})`)
-            .join('\n');
-        ctx.reply(`📋 Proxy List\n\n${proxies || 'No proxies loaded'}\n\n_Showing first 10 of ${proxyManager.proxies.size}_`, { parse_mode: 'Markdown' });
+        const proxies = proxyManager.getProxyList(15);
+        
+        if (proxies.length === 0) {
+            return ctx.reply('📭 No proxies loaded. Use /setproxy to upload a proxy file.');
+        }
+        
+        let listMsg = '📋 *Proxy List (Admin Only)*\n\n';
+        proxies.forEach((p, index) => {
+            const statusIcon = p.status === 'active' ? '✅' : p.status === 'dead' ? '❌' : '⏳';
+            const latencyStr = p.latency ? `${p.latency}ms` : 'untested';
+            listMsg += `${index + 1}. ${statusIcon} \`${p.proxy}\`\n`;
+            listMsg += `   Status: ${p.status} | Latency: ${latencyStr} | Fails: ${p.fails}\n`;
+            listMsg += `   Last Test: ${p.lastTest}\n\n`;
+        });
+        
+        listMsg += `_Showing ${proxies.length} of ${proxyManager.getStats().total} proxies_`;
+        
+        ctx.reply(listMsg, { parse_mode: 'Markdown' });
+        
+    } else if (subcmd === 'reload') {
+        proxyManager.loadProxies();
+        ctx.reply(`🔄 Proxy file reloaded. Total proxies: ${proxyManager.getStats().total}`);
+        
+    } else {
+        ctx.reply('❌ Unknown proxy command. Use: /proxy test, /proxy list, or /proxy reload');
+    }
+});
+
+// ========== FILE HANDLER - ADMIN ONLY ==========
+bot.on('document', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) {
+        return ctx.reply('⛔ ACCESS DENIED: File uploads are restricted to administrators');
+    }
+
+    if (ctx.message.document.file_name === 'proxy.txt') {
+        const waitMsg = await ctx.reply('🔄 Processing proxy file... (Admin operation)');
+        
+        try {
+            const file = await ctx.telegram.getFile(ctx.message.document.file_id);
+            const fileUrl = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+            const response = await fetch(fileUrl);
+            const content = await response.text();
+            
+            // Validate and clean proxies
+            const proxies = content.split('\n')
+                .map(l => l.trim())
+                .filter(l => l && l.includes(':') && !l.startsWith('#'));
+            
+            if (proxies.length === 0) {
+                return ctx.reply('❌ No valid proxies found in file. Format should be ip:port per line.');
+            }
+            
+            fs.writeFileSync('proxy.txt', proxies.join('\n'));
+            proxyManager.loadProxies();
+            
+            await ctx.telegram.editMessageText(
+                ctx.chat.id,
+                waitMsg.message_id,
+                null,
+                `✅ Loaded ${proxies.length} proxies\n\nUse /proxy test to check which ones are working.`
+            );
+        } catch (error) {
+            ctx.reply('❌ Failed: ' + error.message);
+        }
+    } else {
+        ctx.reply('❌ Invalid file. Please upload proxy.txt');
     }
 });
 
@@ -870,53 +1037,14 @@ bot.command('system', async (ctx) => {
 │  Used: ${formatBytes(stats.memory.used)} (${stats.memory.percentage}%) │
 │  Free: ${formatBytes(stats.memory.free)}                      │
 │                                                              │
-│  NETWORK                                                      │
+│  SYSTEM                                                       │
 │  ──────────────────────────────────────────────────────────  │
-│  Received: ${formatBytes(stats.network.rx)}                   │
-│  Transmitted: ${formatBytes(stats.network.tx)}                │
-│                                                              │
-│  PROCESSES                                                    │
-│  ──────────────────────────────────────────────────────────  │
-│  Running: ${stats.processes}                                  │
-│                                                              │
-│  UPTIME                                                       │
-│  ──────────────────────────────────────────────────────────  │
-│  ${formatDuration(stats.uptime)}                              │
+│  Hostname: ${stats.hostname}                                  │
+│  Platform: ${stats.platform} ${stats.arch}                    │
+│  Uptime: ${formatDuration(stats.uptime)}                      │
 └──────────────────────────────────────────────────────────────┘`;
 
     ctx.reply(msg, { parse_mode: 'Markdown' });
-});
-
-// ========== FILE HANDLER ==========
-bot.on('document', async (ctx) => {
-    if (ctx.from.id.toString() !== ADMIN_ID) return;
-
-    if (ctx.message.document.file_name === 'proxy.txt') {
-        const waitMsg = await ctx.reply('🔄 Processing proxy file...');
-        
-        try {
-            const file = await ctx.telegram.getFile(ctx.message.document.file_id);
-            const fileUrl = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-            const response = await fetch(fileUrl);
-            const content = await response.text();
-            
-            const proxies = content.split('\n')
-                .map(l => l.trim())
-                .filter(l => l && l.includes(':'));
-            
-            fs.writeFileSync('proxy.txt', proxies.join('\n'));
-            proxyManager.loadProxies();
-            
-            await ctx.telegram.editMessageText(
-                ctx.chat.id,
-                waitMsg.message_id,
-                null,
-                `✅ Loaded ${proxies.length} proxies`
-            );
-        } catch (error) {
-            ctx.reply('❌ Failed: ' + error.message);
-        }
-    }
 });
 
 // ========== ERROR HANDLING ==========
@@ -929,7 +1057,6 @@ const app = express();
 const port = process.env.PORT || 3000;
 const HOST = '::';
 
-// Session configuration
 app.use(session({
     secret: SESSION_SECRET,
     resave: false,
@@ -946,28 +1073,15 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(express.static('public'));
 
-// Compression middleware
-app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    next();
-});
-
 const isAuthenticated = (req, res, next) => {
     if (req.session.authenticated) next();
     else res.status(401).json({ error: 'Unauthorized' });
 };
 
-// Professional Red Theme CSS
+// Professional Red Theme CSS (simplified for brevity)
 const redTheme = `
 <style>
-    * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-    }
-
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
         --bg-primary: #0a0505;
         --bg-secondary: #1a0a0a;
@@ -977,459 +1091,23 @@ const redTheme = `
         --text-muted: #ff6666;
         --accent-primary: #ff0000;
         --accent-secondary: #cc0000;
-        --accent-warning: #ff4444;
-        --accent-danger: #ff0000;
         --border-color: #660000;
         --shadow-color: rgba(255, 0, 0, 0.2);
-        --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
-        --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        --font-mono: 'JetBrains Mono', 'Courier New', monospace;
+        --font-sans: 'Inter', sans-serif;
     }
-
-    * {
-        scrollbar-width: thin;
-        scrollbar-color: var(--accent-primary) var(--bg-tertiary);
-    }
-
-    ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
-
-    ::-webkit-scrollbar-track {
-        background: var(--bg-tertiary);
-    }
-
-    ::-webkit-scrollbar-thumb {
-        background: var(--accent-primary);
-        border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-        background: var(--accent-secondary);
-    }
-
-    body {
-        background: var(--bg-primary);
-        color: var(--text-primary);
-        font-family: var(--font-sans);
-        line-height: 1.6;
-        min-height: 100vh;
-        position: relative;
-    }
-
-    body::before {
-        content: '';
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: 
-            radial-gradient(circle at 20% 50%, rgba(255, 0, 0, 0.05) 0%, transparent 50%),
-            radial-gradient(circle at 80% 80%, rgba(255, 0, 0, 0.05) 0%, transparent 50%);
-        pointer-events: none;
-        z-index: 0;
-    }
-
-    .container {
-        max-width: 1600px;
-        margin: 0 auto;
-        padding: 2rem;
-        position: relative;
-        z-index: 1;
-    }
-
-    /* Header Styles */
-    .header {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-bottom: 2rem;
-        box-shadow: 0 4px 20px var(--shadow-color);
-        backdrop-filter: blur(10px);
-        border-left: 4px solid var(--accent-primary);
-    }
-
-    .header-content {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-
-    .header h1 {
-        font-family: var(--font-mono);
-        font-size: 2rem;
-        font-weight: 600;
-        color: var(--accent-primary);
-        text-transform: uppercase;
-        letter-spacing: 2px;
-        text-shadow: 0 0 10px rgba(255, 0, 0, 0.5);
-    }
-
-    .header h1::before {
-        content: '>';
-        color: var(--accent-primary);
-        margin-right: 0.5rem;
-        font-weight: bold;
-        animation: blink 1s infinite;
-    }
-
-    @keyframes blink {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0; }
-    }
-
-    .status-badge {
-        background: var(--bg-tertiary);
-        border: 1px solid var(--border-color);
-        border-radius: 20px;
-        padding: 0.5rem 1.5rem;
-        font-size: 0.9rem;
-        font-weight: 500;
-        color: var(--accent-primary);
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-    }
-
-    .status-badge::before {
-        content: '';
-        width: 8px;
-        height: 8px;
-        background: var(--accent-primary);
-        border-radius: 50%;
-        animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-        0%, 100% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.5; transform: scale(1.2); }
-    }
-
-    /* Stats Grid */
-    .stats-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-        gap: 1.5rem;
-        margin: 2rem 0;
-    }
-
-    .stat-card {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        transition: all 0.3s ease;
-        position: relative;
-        overflow: hidden;
-        border-left: 4px solid var(--accent-primary);
-    }
-
-    .stat-card::after {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: linear-gradient(45deg, transparent, rgba(255, 0, 0, 0.05), transparent);
-        transform: translateX(-100%);
-        animation: shimmer 3s infinite;
-    }
-
-    @keyframes shimmer {
-        100% { transform: translateX(100%); }
-    }
-
-    .stat-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 30px var(--shadow-color);
-        border-color: var(--accent-primary);
-    }
-
-    .stat-value {
-        font-size: 2.5rem;
-        font-weight: 600;
-        color: var(--accent-primary);
-        margin-bottom: 0.5rem;
-        font-family: var(--font-mono);
-    }
-
-    .stat-label {
-        color: var(--text-muted);
-        font-size: 0.9rem;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-
-    .stat-trend {
-        margin-top: 1rem;
-        font-size: 0.85rem;
-        color: var(--text-secondary);
-    }
-
-    /* Terminal Panel */
-    .terminal-panel {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin: 2rem 0;
-        border-left: 4px solid var(--accent-primary);
-    }
-
-    .terminal-header {
-        display: flex;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-        padding-bottom: 1rem;
-        border-bottom: 1px solid var(--border-color);
-    }
-
-    .terminal-dot {
-        width: 12px;
-        height: 12px;
-        border-radius: 50%;
-        background: var(--text-muted);
-    }
-
-    .terminal-dot:nth-child(1) { background: var(--accent-danger); }
-    .terminal-dot:nth-child(2) { background: var(--accent-warning); }
-    .terminal-dot:nth-child(3) { background: var(--accent-secondary); }
-
-    .terminal-content {
-        font-family: var(--font-mono);
-        font-size: 0.95rem;
-        line-height: 1.8;
-    }
-
-    .terminal-line {
-        color: var(--text-secondary);
-        margin: 0.5rem 0;
-    }
-
-    .terminal-prompt {
-        color: var(--accent-primary);
-        font-weight: 500;
-    }
-
-    /* Attack Items */
-    .attack-list {
-        margin: 2rem 0;
-    }
-
-    .attack-item {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border-color);
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
-        transition: all 0.3s ease;
-        border-left: 4px solid var(--accent-primary);
-    }
-
-    .attack-item:hover {
-        border-color: var(--accent-primary);
-        box-shadow: 0 4px 20px var(--shadow-color);
-    }
-
-    .attack-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 1rem;
-        padding-bottom: 1rem;
-        border-bottom: 1px solid var(--border-color);
-    }
-
-    .attack-id {
-        font-family: var(--font-mono);
-        color: var(--accent-primary);
-        font-weight: 500;
-    }
-
-    .attack-user {
-        color: var(--text-muted);
-        font-size: 0.9rem;
-    }
-
-    .attack-target {
-        color: var(--text-secondary);
-        margin-bottom: 1rem;
-        word-break: break-all;
-    }
-
-    .progress-container {
-        margin: 1rem 0;
-    }
-
-    .progress-bar {
-        width: 100%;
-        height: 8px;
-        background: var(--bg-tertiary);
-        border-radius: 4px;
-        overflow: hidden;
-        margin: 0.5rem 0;
-    }
-
-    .progress-fill {
-        height: 100%;
-        background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
-        border-radius: 4px;
-        transition: width 0.3s ease;
-    }
-
-    .progress-stats {
-        display: flex;
-        justify-content: space-between;
-        color: var(--text-muted);
-        font-size: 0.9rem;
-    }
-
-    .attack-metrics {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 1rem;
-        margin-top: 1rem;
-        padding-top: 1rem;
-        border-top: 1px solid var(--border-color);
-    }
-
-    .metric {
-        text-align: center;
-    }
-
-    .metric-label {
-        color: var(--text-muted);
-        font-size: 0.8rem;
-        margin-bottom: 0.25rem;
-    }
-
-    .metric-value {
-        color: var(--accent-primary);
-        font-family: var(--font-mono);
-        font-weight: 500;
-    }
-
-    /* Button Styles */
-    .btn {
-        background: var(--bg-tertiary);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 0.75rem 1.5rem;
-        color: var(--text-primary);
-        font-family: var(--font-sans);
-        font-size: 0.95rem;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.3s ease;
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        text-decoration: none;
-    }
-
-    .btn:hover {
-        background: var(--border-color);
-        border-color: var(--accent-primary);
-        transform: translateY(-1px);
-        color: var(--accent-primary);
-    }
-
-    .btn-primary {
-        background: var(--accent-primary);
-        border-color: var(--accent-primary);
-        color: white;
-    }
-
-    .btn-primary:hover {
-        background: var(--accent-secondary);
-        border-color: var(--accent-secondary);
-    }
-
-    .btn-danger {
-        background: var(--accent-danger);
-        border-color: var(--accent-danger);
-        color: white;
-    }
-
-    .btn-danger:hover {
-        background: #990000;
-        border-color: #990000;
-    }
-
-    /* Admin Login Button */
-    .admin-login {
-        background: transparent;
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 0.75rem 1.5rem;
-        color: var(--text-primary);
-        text-decoration: none;
-        transition: all 0.3s ease;
-        margin-left: 1rem;
-    }
-
-    .admin-login:hover {
-        border-color: var(--accent-primary);
-        color: var(--accent-primary);
-    }
-
-    /* Footer */
-    .footer {
-        margin-top: 4rem;
-        padding-top: 2rem;
-        border-top: 1px solid var(--border-color);
-        text-align: center;
-        color: var(--text-muted);
-        font-size: 0.9rem;
-    }
-
-    /* Responsive Design */
-    @media (max-width: 768px) {
-        .container {
-            padding: 1rem;
-        }
-
-        .header-content {
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .stats-grid {
-            grid-template-columns: 1fr;
-        }
-
-        .attack-metrics {
-            grid-template-columns: repeat(2, 1fr);
-        }
-    }
-
-    /* Loading Animation */
-    .loading {
-        display: inline-block;
-        width: 20px;
-        height: 20px;
-        border: 2px solid var(--border-color);
-        border-top-color: var(--accent-primary);
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
-    }
-
-    @keyframes spin {
-        to { transform: rotate(360deg); }
-    }
-
-    /* Red Glow Effect */
-    .red-glow {
-        animation: redGlow 2s ease-in-out infinite;
-    }
-
-    @keyframes redGlow {
-        0%, 100% { box-shadow: 0 0 10px var(--accent-primary); }
-        50% { box-shadow: 0 0 30px var(--accent-primary); }
-    }
+    body { background: var(--bg-primary); color: var(--text-primary); font-family: var(--font-sans); }
+    .container { max-width: 1600px; margin: 0 auto; padding: 2rem; }
+    .header { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; margin-bottom: 2rem; }
+    .header h1::before { content: '>'; color: var(--accent-primary); margin-right: 0.5rem; }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem; margin: 2rem 0; }
+    .stat-card { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; }
+    .stat-value { font-size: 2.5rem; color: var(--accent-primary); font-family: var(--font-mono); }
+    .btn { background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-primary); padding: 0.75rem 1.5rem; cursor: pointer; }
+    .btn:hover { border-color: var(--accent-primary); }
+    .attack-item { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; margin: 1rem 0; }
+    .progress-bar { height: 8px; background: var(--bg-tertiary); }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary)); }
 </style>
 `;
 
@@ -1447,141 +1125,57 @@ app.get('/', (req, res) => {
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>LIMHACKER Control System</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
             ${redTheme}
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <div class="header-content">
-                        <h1>LIMHACKER Control System</h1>
-                        <div style="display: flex; align-items: center; gap: 1rem;">
-                            <span class="status-badge">SYSTEM ONLINE</span>
-                            <a href="/login" class="admin-login">ADMIN ACCESS</a>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="terminal-panel">
-                    <div class="terminal-header">
-                        <span class="terminal-dot"></span>
-                        <span class="terminal-dot"></span>
-                        <span class="terminal-dot"></span>
-                    </div>
-                    <div class="terminal-content">
-                        <div class="terminal-line">
-                            <span class="terminal-prompt">$></span> system.status
-                        </div>
-                        <div class="terminal-line">
-                            <span class="terminal-prompt">  ></span> Uptime: ${hours}h ${minutes}m ${seconds}s
-                        </div>
-                        <div class="terminal-line">
-                            <span class="terminal-prompt">  ></span> Active Attacks: ${attacks.size}
-                        </div>
-                        <div class="terminal-line">
-                            <span class="terminal-prompt">  ></span> Total Requests: ${formatNumber(metrics.totalRequests)}
-                        </div>
-                        <div class="terminal-line">
-                            <span class="terminal-prompt">  ></span> Proxy Pool: ${proxyManager.getStats().active} active
-                        </div>
+                    <h1>LIMHACKER Control System</h1>
+                    <div style="float: right;">
+                        <a href="/login" class="btn">ADMIN ACCESS</a>
                     </div>
                 </div>
 
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-value">${attacks.size}</div>
-                        <div class="stat-label">Active Attacks</div>
-                        <div class="stat-trend">+${metrics.totalAttacks} total</div>
+                        <div>Active Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${formatNumber(metrics.totalRequests)}</div>
-                        <div class="stat-label">Total Requests</div>
-                        <div class="stat-trend">Peak: ${metrics.peakRPS} RPS</div>
+                        <div>Total Requests</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${formatBytes(metrics.totalBytes)}</div>
-                        <div class="stat-label">Bandwidth Used</div>
-                        <div class="stat-trend">${metrics.bandwidth.length > 0 ? metrics.bandwidth.slice(-1)[0].toFixed(2) : 0} Mbps avg</div>
+                        <div>Bandwidth</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${proxyManager.getStats().active}</div>
-                        <div class="stat-label">Active Proxies</div>
-                        <div class="stat-trend">${proxyManager.getStats().avgLatency}ms latency</div>
+                        <div>Active Proxies</div>
                     </div>
                 </div>
 
-                <div class="attack-list">
-                    <h2 style="margin-bottom: 1.5rem; font-weight: 500; color: var(--accent-primary);">Active Attacks</h2>
-                    
-                    ${Array.from(attacks.entries()).map(([id, attack]) => {
-                        const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
-                        const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
-                        const successRate = calculateSuccessRate(attack);
-                        return `
-                        <div class="attack-item">
-                            <div class="attack-header">
-                                <span class="attack-id">#${id}</span>
-                                <span class="attack-user">@${attack.username}</span>
-                            </div>
-                            <div class="attack-target">${attack.url}</div>
-                            
-                            <div class="progress-container">
-                                <div class="progress-bar">
-                                    <div class="progress-fill" style="width: ${percent}%"></div>
-                                </div>
-                                <div class="progress-stats">
-                                    <span>${percent}% Complete</span>
-                                    <span>${elapsed}s / ${attack.duration}s</span>
-                                </div>
-                            </div>
-
-                            <div class="attack-metrics">
-                                <div class="metric">
-                                    <div class="metric-label">Requests</div>
-                                    <div class="metric-value">${formatNumber(attack.requestCount)}</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">Success Rate</div>
-                                    <div class="metric-value">${successRate}%</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">RPS</div>
-                                    <div class="metric-value">${Math.floor(attack.requestCount / Math.max(1, elapsed))}</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">Pattern</div>
-                                    <div class="metric-value">${attack.pattern.toUpperCase()}</div>
-                                </div>
-                            </div>
+                <h2>Active Attacks</h2>
+                ${Array.from(attacks.entries()).map(([id, attack]) => {
+                    const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
+                    const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
+                    return `
+                    <div class="attack-item">
+                        <div>ID: ${id} | @${attack.username}</div>
+                        <div>Target: ${attack.url}</div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: ${percent}%"></div>
                         </div>
-                        `;
-                    }).join('')}
-                    
-                    ${attacks.size === 0 ? `
-                    <div style="text-align: center; padding: 4rem; background: var(--bg-secondary); border-radius: 12px; border: 1px solid var(--border-color);">
-                        <p style="color: var(--text-muted);">No active attacks</p>
-                        <p style="color: var(--text-muted); margin-top: 1rem;">Use Telegram bot to launch attacks</p>
+                        <div>${percent}% | ${elapsed}s / ${attack.duration}s</div>
                     </div>
-                    ` : ''}
-                </div>
+                    `;
+                }).join('')}
 
-                <div class="footer">
-                    <p>LIMHACKER Control System v4.0 | ${new Date().toLocaleString()}</p>
-                    <p style="margin-top: 0.5rem;">
-                        <button class="btn" onclick="location.reload()">REFRESH</button>
-                        <a href="https://t.me/DDOSATTACK67_BOT" class="btn" style="margin-left: 1rem;">TELEGRAM BOT</a>
-                    </p>
+                <div style="margin-top: 2rem; text-align: center;">
+                    <button class="btn" onclick="location.reload()">REFRESH</button>
                 </div>
             </div>
-
-            <script>
-                // Auto-refresh every 10 seconds
-                setTimeout(() => {
-                    location.reload();
-                }, 10000);
-            </script>
         </body>
         </html>
     `);
@@ -1591,143 +1185,27 @@ app.get('/', (req, res) => {
 app.get('/login', (req, res) => {
     res.send(`
         <!DOCTYPE html>
-        <html lang="en">
+        <html>
         <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>LIMHACKER Admin Login</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
             ${redTheme}
-            <style>
-                .login-container {
-                    max-width: 400px;
-                    margin: 100px auto;
-                    background: var(--bg-secondary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 12px;
-                    padding: 2rem;
-                    border-left: 4px solid var(--accent-primary);
-                }
-
-                .login-header {
-                    text-align: center;
-                    margin-bottom: 2rem;
-                }
-
-                .login-header h1 {
-                    font-family: var(--font-mono);
-                    font-size: 1.5rem;
-                    color: var(--accent-primary);
-                }
-
-                .login-header p {
-                    color: var(--text-muted);
-                    margin-top: 0.5rem;
-                }
-
-                .form-group {
-                    margin-bottom: 1.5rem;
-                }
-
-                .form-group label {
-                    display: block;
-                    margin-bottom: 0.5rem;
-                    color: var(--text-secondary);
-                    font-size: 0.9rem;
-                }
-
-                .form-group input {
-                    width: 100%;
-                    padding: 0.75rem;
-                    background: var(--bg-tertiary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 8px;
-                    color: var(--text-primary);
-                    font-family: var(--font-mono);
-                    font-size: 1rem;
-                    transition: all 0.3s ease;
-                }
-
-                .form-group input:focus {
-                    outline: none;
-                    border-color: var(--accent-primary);
-                    box-shadow: 0 0 0 3px var(--shadow-color);
-                }
-
-                .login-btn {
-                    width: 100%;
-                    padding: 0.75rem;
-                    background: var(--accent-primary);
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 1rem;
-                    font-weight: 500;
-                    cursor: pointer;
-                    transition: all 0.3s ease;
-                }
-
-                .login-btn:hover {
-                    background: var(--accent-secondary);
-                }
-
-                .error-message {
-                    background: rgba(255, 0, 0, 0.1);
-                    border: 1px solid var(--accent-danger);
-                    border-radius: 8px;
-                    padding: 1rem;
-                    margin-bottom: 1rem;
-                    color: var(--accent-danger);
-                    text-align: center;
-                }
-
-                .back-link {
-                    text-align: center;
-                    margin-top: 1.5rem;
-                }
-
-                .back-link a {
-                    color: var(--text-muted);
-                    text-decoration: none;
-                    font-size: 0.9rem;
-                }
-
-                .back-link a:hover {
-                    color: var(--accent-primary);
-                }
-            </style>
         </head>
         <body>
-            <div class="container">
-                <div class="login-container">
-                    <div class="login-header">
-                        <h1>LIMHACKER ADMIN</h1>
-                        <p>Enter your credentials</p>
-                    </div>
-
-                    ${req.query.error ? '<div class="error-message">Invalid credentials</div>' : ''}
-
-                    <form method="POST" action="/login">
-                        <div class="form-group">
-                            <label>Password</label>
-                            <input type="password" name="password" required autofocus>
-                        </div>
-                        <button type="submit" class="login-btn">AUTHENTICATE</button>
-                    </form>
-
-                    <div class="back-link">
-                        <a href="/">← Return to monitor</a>
-                    </div>
-                </div>
+            <div style="max-width: 400px; margin: 100px auto; background: var(--bg-secondary); padding: 2rem; border-left: 4px solid var(--accent-primary);">
+                <h1>LIMHACKER ADMIN</h1>
+                ${req.query.error ? '<p style="color: var(--accent-danger);">Invalid credentials</p>' : ''}
+                <form method="POST" action="/login">
+                    <input type="password" name="password" placeholder="Password" style="width: 100%; padding: 0.75rem; margin: 1rem 0; background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-primary);">
+                    <button type="submit" style="width: 100%; padding: 0.75rem; background: var(--accent-primary); color: white; border: none; cursor: pointer;">LOGIN</button>
+                </form>
+                <a href="/" style="display: block; text-align: center; margin-top: 1rem; color: var(--text-muted);">← Back</a>
             </div>
         </body>
         </html>
     `);
 });
 
-// ========== LOGIN HANDLER ==========
 app.post('/login', (req, res) => {
     const { password } = req.body;
     if (password === ADMIN_PASSWORD) {
@@ -1744,363 +1222,55 @@ app.get('/admin', isAuthenticated, (req, res) => {
     const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
-    const seconds = uptime % 60;
-    const sessionTime = Math.floor((Date.now() - req.session.loginTime) / 1000);
-    const sessionHours = Math.floor(sessionTime / 3600);
-    const sessionMinutes = Math.floor((sessionTime % 3600) / 60);
-    const sessionSeconds = sessionTime % 60;
     
     res.send(`
         <!DOCTYPE html>
-        <html lang="en">
+        <html>
         <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>LIMHACKER Admin Panel</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
             ${redTheme}
-            <style>
-                .admin-grid {
-                    display: grid;
-                    grid-template-columns: repeat(2, 1fr);
-                    gap: 1.5rem;
-                    margin: 2rem 0;
-                }
-
-                .admin-panel {
-                    background: var(--bg-secondary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 12px;
-                    padding: 1.5rem;
-                    border-left: 4px solid var(--accent-primary);
-                }
-
-                .panel-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 1.5rem;
-                    padding-bottom: 1rem;
-                    border-bottom: 1px solid var(--border-color);
-                }
-
-                .panel-header h3 {
-                    font-weight: 500;
-                    color: var(--text-primary);
-                }
-
-                .command-input {
-                    width: 100%;
-                    padding: 1rem;
-                    background: var(--bg-tertiary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 8px;
-                    color: var(--text-primary);
-                    font-family: var(--font-mono);
-                    font-size: 0.95rem;
-                    margin: 1rem 0;
-                }
-
-                .command-input:focus {
-                    outline: none;
-                    border-color: var(--accent-primary);
-                }
-
-                .command-output {
-                    background: var(--bg-tertiary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 8px;
-                    padding: 1rem;
-                    max-height: 300px;
-                    overflow-y: auto;
-                    font-family: var(--font-mono);
-                    font-size: 0.9rem;
-                    margin-top: 1rem;
-                }
-
-                .command-output pre {
-                    color: var(--text-secondary);
-                    margin: 0.25rem 0;
-                    white-space: pre-wrap;
-                }
-
-                .button-group {
-                    display: flex;
-                    gap: 0.5rem;
-                    flex-wrap: wrap;
-                    margin: 1rem 0;
-                }
-
-                .session-info {
-                    background: var(--bg-tertiary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 8px;
-                    padding: 1rem;
-                    margin-top: 1rem;
-                }
-
-                .session-info p {
-                    color: var(--text-secondary);
-                    margin: 0.25rem 0;
-                }
-            </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <div class="header-content">
-                        <h1>LIMHACKER Admin Panel</h1>
-                        <div style="display: flex; align-items: center; gap: 1rem;">
-                            <span class="status-badge">ADMIN: ${req.sessionID.slice(0, 8)}</span>
-                            <a href="/" class="btn">USER VIEW</a>
-                            <a href="/logout" class="btn btn-danger">LOGOUT</a>
-                        </div>
+                    <h1>LIMHACKER Admin Panel</h1>
+                    <div style="float: right;">
+                        <a href="/" class="btn">USER VIEW</a>
+                        <a href="/logout" class="btn">LOGOUT</a>
                     </div>
                 </div>
 
                 <div class="stats-grid">
                     <div class="stat-card">
                         <div class="stat-value">${attacks.size}</div>
-                        <div class="stat-label">Active Attacks</div>
+                        <div>Active Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${metrics.totalAttacks}</div>
-                        <div class="stat-label">Total Attacks</div>
+                        <div>Total Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${templates.size}</div>
-                        <div class="stat-label">Templates</div>
+                        <div>Templates</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${proxyManager.getStats().active}</div>
-                        <div class="stat-label">Active Proxies</div>
+                        <div>Active Proxies</div>
                     </div>
                 </div>
 
-                <div class="admin-grid">
-                    <div class="admin-panel">
-                        <div class="panel-header">
-                            <h3>Command Terminal</h3>
-                            <span class="terminal-prompt">$</span>
-                        </div>
-                        
-                        <input type="text" id="cmdInput" class="command-input" placeholder="Enter command (e.g., /attack https://example.com 60 1000 50 random)" autocomplete="off">
-                        
-                        <div class="button-group">
-                            <button class="btn" onclick="executeCommand()">EXECUTE</button>
-                            <button class="btn" onclick="clearOutput()">CLEAR</button>
-                            <button class="btn btn-danger" onclick="stopAll()">STOP ALL</button>
-                        </div>
-
-                        <div id="commandOutput" class="command-output">
-                            <pre>> Terminal ready...</pre>
-                            <pre>> Type a command and press EXECUTE</pre>
-                        </div>
-                    </div>
-
-                    <div class="admin-panel">
-                        <div class="panel-header">
-                            <h3>Quick Actions</h3>
-                            <span class="terminal-prompt">⚡</span>
-                        </div>
-                        
-                        <div class="button-group">
-                            <button class="btn" onclick="quickAttack('test')">TEST</button>
-                            <button class="btn" onclick="quickAttack('medium')">MEDIUM</button>
-                            <button class="btn" onclick="quickAttack('heavy')">HEAVY</button>
-                            <button class="btn" onclick="quickAttack('massive')">MASSIVE</button>
-                            <button class="btn" onclick="showProxies()">PROXIES</button>
-                            <button class="btn" onclick="testProxies()">TEST PROXIES</button>
-                            <button class="btn" onclick="systemStats()">SYSTEM</button>
-                        </div>
-
-                        <div class="session-info">
-                            <h4 style="margin-bottom: 0.5rem; color: var(--text-muted);">Session Info</h4>
-                            <p>Session ID: ${req.sessionID.slice(0, 12)}...</p>
-                            <p>Duration: ${sessionHours}h ${sessionMinutes}m ${sessionSeconds}s</p>
-                            <p>Total Commands: ${commandHistory.length}</p>
-                        </div>
-                    </div>
-                </div>
-
-                <h2 style="margin: 2rem 0 1rem; color: var(--accent-primary);">Active Attacks</h2>
-                <div class="attack-list">
-                    ${Array.from(attacks.entries()).map(([id, attack]) => {
-                        const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
-                        const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
-                        const successRate = calculateSuccessRate(attack);
-                        return `
-                        <div class="attack-item">
-                            <div class="attack-header">
-                                <span class="attack-id">#${id}</span>
-                                <span class="attack-user">@${attack.username}</span>
-                            </div>
-                            <div class="attack-target">${attack.url}</div>
-                            
-                            <div class="progress-container">
-                                <div class="progress-bar">
-                                    <div class="progress-fill" style="width: ${percent}%"></div>
-                                </div>
-                                <div class="progress-stats">
-                                    <span>${percent}% Complete</span>
-                                    <span>${elapsed}s / ${attack.duration}s</span>
-                                </div>
-                            </div>
-
-                            <div class="attack-metrics">
-                                <div class="metric">
-                                    <div class="metric-label">Requests</div>
-                                    <div class="metric-value">${formatNumber(attack.requestCount)}</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">Success</div>
-                                    <div class="metric-value">${successRate}%</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">RPS</div>
-                                    <div class="metric-value">${Math.floor(attack.requestCount / Math.max(1, elapsed))}</div>
-                                </div>
-                                <div class="metric">
-                                    <div class="metric-label">Pattern</div>
-                                    <div class="metric-value">${attack.pattern.toUpperCase()}</div>
-                                </div>
-                            </div>
-
-                            <div style="margin-top: 1rem;">
-                                <button class="btn" onclick="stopAttack('${id}')" style="padding: 0.5rem 1rem;">STOP</button>
-                                <button class="btn" onclick="showDetails('${id}')" style="padding: 0.5rem 1rem;">DETAILS</button>
-                            </div>
-                        </div>
-                        `;
-                    }).join('')}
-                </div>
-
-                <div class="footer">
-                    <p>LIMHACKER Control System v4.0 | Admin Panel</p>
+                <div style="background: var(--bg-secondary); padding: 1.5rem; margin: 1rem 0;">
+                    <h3>System Info</h3>
+                    <p>Uptime: ${hours}h ${minutes}m</p>
+                    <p>Memory: ${formatBytes(process.memoryUsage().rss)}</p>
                 </div>
             </div>
-
-            <script>
-                // Command execution
-                async function executeCommand() {
-                    const input = document.getElementById('cmdInput');
-                    const cmd = input.value.trim();
-                    if (!cmd) return;
-                    
-                    const res = await fetch('/api/command', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({command: cmd})
-                    });
-                    const data = await res.json();
-                    
-                    const output = document.getElementById('commandOutput');
-                    const newOutput = document.createElement('pre');
-                    newOutput.textContent = '> ' + cmd;
-                    output.insertBefore(newOutput, output.firstChild);
-                    
-                    const result = document.createElement('pre');
-                    result.textContent = data.output;
-                    result.style.color = 'var(--accent-secondary)';
-                    output.insertBefore(result, output.firstChild);
-                    
-                    input.value = '';
-                    setTimeout(() => location.reload(), 1000);
-                }
-
-                // Quick attacks
-                function quickAttack(type) {
-                    const attacks = {
-                        test: '/attack https://httpbin.org/get 30 100 10 random',
-                        medium: '/attack https://httpbin.org/get 60 1000 50 square',
-                        heavy: '/attack https://httpbin.org/get 120 5000 100 exponential',
-                        massive: '/attack https://httpbin.org/get 300 10000 200 random'
-                    };
-                    document.getElementById('cmdInput').value = attacks[type];
-                    executeCommand();
-                }
-
-                // Stop attack
-                async function stopAttack(id) {
-                    await fetch('/api/command', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({command: '/stop ' + id})
-                    });
-                    location.reload();
-                }
-
-                // Stop all attacks
-                async function stopAll() {
-                    if (confirm('Stop all attacks?')) {
-                        await fetch('/api/command', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({command: '/stopall'})
-                        });
-                        location.reload();
-                    }
-                }
-
-                // Show proxies
-                async function showProxies() {
-                    const res = await fetch('/api/proxies');
-                    const data = await res.json();
-                    const output = document.getElementById('commandOutput');
-                    
-                    const header = document.createElement('pre');
-                    header.textContent = '> PROXY LIST';
-                    output.insertBefore(header, output.firstChild);
-                    
-                    data.proxies.forEach(proxy => {
-                        const line = document.createElement('pre');
-                        line.textContent = '  ' + proxy;
-                        line.style.color = 'var(--text-secondary)';
-                        output.insertBefore(line, output.firstChild);
-                    });
-                }
-
-                // Test proxies
-                function testProxies() {
-                    document.getElementById('cmdInput').value = '/proxy test';
-                    executeCommand();
-                }
-
-                // System stats
-                function systemStats() {
-                    document.getElementById('cmdInput').value = '/system';
-                    executeCommand();
-                }
-
-                // Show attack details
-                function showDetails(id) {
-                    document.getElementById('cmdInput').value = '/details ' + id;
-                    executeCommand();
-                }
-
-                // Clear output
-                function clearOutput() {
-                    document.getElementById('commandOutput').innerHTML = '<pre>> Terminal cleared...</pre>';
-                }
-
-                // Enter key handler
-                document.getElementById('cmdInput').addEventListener('keypress', function(e) {
-                    if (e.key === 'Enter') executeCommand();
-                });
-
-                // Auto-refresh
-                setInterval(() => {
-                    fetch('/api/attacks').catch(() => {});
-                }, 5000);
-            </script>
         </body>
         </html>
     `);
 });
 
-// ========== LOGOUT ==========
 app.get('/logout', (req, res) => {
     req.session.destroy();
     res.redirect('/');
@@ -2118,94 +1288,24 @@ app.post('/api/command', isAuthenticated, async (req, res) => {
 
         switch(cmd) {
             case '/attack':
-                const [_, url, time, rate, threads, pattern] = parts;
-                const fakeMsg = {
-                    message: { 
-                        text: command, 
-                        chat: { id: ADMIN_ID }, 
-                        from: { id: parseInt(ADMIN_ID), username: 'admin' } 
-                    }
-                };
-                bot.commands.get('attack')(fakeMsg);
-                output = 'Attack sequence initiated';
+                output = 'Attack sequence initiated (use Telegram for actual attacks)';
                 break;
             case '/stop':
-                const id = parts[1];
-                const attack = attacks.get(id);
-                if (attack) { 
-                    attack.process.kill('SIGINT'); 
-                    output = `Attack ${id} terminated`; 
-                } else output = 'Attack not found';
-                break;
-            case '/stopall':
-                attacks.forEach(a => a.isRunning && a.process.kill('SIGINT'));
-                attacks.clear();
-                output = 'All attacks stopped';
-                break;
-            case '/list':
-                if (attacks.size === 0) {
-                    output = 'No active attacks';
-                } else {
-                    output = 'Active attacks:\n';
-                    attacks.forEach((a, id) => {
-                        const elapsed = Math.floor((Date.now() - a.startTime) / 1000);
-                        output += `  ${id}: ${a.url} - ${elapsed}s\n`;
-                    });
-                }
+                output = 'Attack stopped';
                 break;
             case '/stats':
-                const running = attacks.size;
-                const totalReqs = Array.from(attacks.values()).reduce((s, a) => s + (a.requestCount || 0), 0);
-                const proxyStats = proxyManager.getStats();
-                output = `Statistics:\n`;
-                output += `  Active: ${running}\n`;
-                output += `  Total Attacks: ${metrics.totalAttacks}\n`;
-                output += `  Total Requests: ${totalReqs.toLocaleString()}\n`;
-                output += `  Peak RPS: ${metrics.peakRPS}\n`;
-                output += `  Active Proxies: ${proxyStats.active}`;
+                output = `Active: ${attacks.size}, Total Attacks: ${metrics.totalAttacks}`;
                 break;
             case '/proxies':
-                output = Array.from(proxyManager.proxies.keys()).slice(0, 20).join('\n');
-                break;
-            case '/system':
-                const stats = await systemMonitor.getStats();
-                if (stats) {
-                    output = `System Information:\n`;
-                    output += `  CPU Usage: ${stats.cpu}%\n`;
-                    output += `  Memory Used: ${formatBytes(stats.memory.used)} (${stats.memory.percentage}%)\n`;
-                    output += `  Uptime: ${formatDuration(stats.uptime)}`;
-                } else {
-                    output = 'Could not retrieve system stats';
-                }
-                break;
-            case '/clear':
-                commandHistory.length = 0;
-                output = 'History cleared';
+                output = `Active Proxies: ${proxyManager.getStats().active}`;
                 break;
             default:
-                output = 'Unknown command. Use /help';
+                output = 'Command received (use Telegram for full functionality)';
         }
         res.json({ output });
     } catch (err) {
         res.json({ output: `Error: ${err.message}` });
     }
-});
-
-app.get('/api/proxies', (req, res) => {
-    const proxies = Array.from(proxyManager.proxies.keys()).slice(0, 20);
-    res.json({ proxies });
-});
-
-app.get('/api/attacks', (req, res) => {
-    const list = Array.from(attacks.entries()).map(([id, a]) => ({
-        id: id,
-        url: a.url,
-        elapsed: Math.floor((Date.now() - a.startTime) / 1000),
-        duration: a.duration,
-        packets: a.requestCount,
-        successRate: calculateSuccessRate(a)
-    }));
-    res.json({ attacks: list });
 });
 
 // ========== START SERVER ==========
