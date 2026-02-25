@@ -73,10 +73,10 @@ const metrics = {
     responseTime: []
 };
 
-// ========== PROXY MANAGER - FULLY FUNCTIONAL ==========
+// ========== PROXY MANAGER ==========
 class ProxyManager {
     constructor() {
-        this.proxies = new Map(); // Store proxy data
+        this.proxies = new Map();
         this.stats = {
             total: 0,
             active: 0,
@@ -85,7 +85,6 @@ class ProxyManager {
             lastCheck: Date.now()
         };
         this.loadProxies();
-        // Don't auto-test on startup - let user trigger tests
     }
 
     loadProxies() {
@@ -100,7 +99,6 @@ class ProxyManager {
                 .map(l => l.trim())
                 .filter(l => l && l.includes(':'));
             
-            // Clear existing proxies
             this.proxies.clear();
             
             lines.forEach(proxy => {
@@ -138,54 +136,6 @@ class ProxyManager {
         this.stats.lastCheck = Date.now();
     }
 
-    getProxy() {
-        if (this.proxies.size === 0) return null;
-        
-        // Get only working proxies
-        const workingProxies = Array.from(this.proxies.entries())
-            .filter(([_, data]) => data.fails < CONFIG.MAX_PROXY_FAILS && data.status === 'active');
-        
-        if (workingProxies.length === 0) return null;
-        
-        // Random selection from working proxies
-        const selected = workingProxies[Math.floor(Math.random() * workingProxies.length)];
-        selected[1].lastUsed = Date.now();
-        return selected[0];
-    }
-
-    reportSuccess(proxy) {
-        const data = this.proxies.get(proxy);
-        if (data) {
-            data.successCount++;
-            data.fails = 0; // Reset fails on success
-            data.status = 'active';
-            this.updateStats();
-        }
-    }
-
-    reportFailure(proxy) {
-        const data = this.proxies.get(proxy);
-        if (data) {
-            data.fails++;
-            data.failCount++;
-            if (data.fails >= CONFIG.MAX_PROXY_FAILS) {
-                data.status = 'dead';
-                console.log('\x1b[31m%s\x1b[0m', `❌ Proxy marked as dead: ${proxy}`);
-            }
-            this.updateStats();
-        }
-    }
-
-    reportLatency(proxy, ms) {
-        const data = this.proxies.get(proxy);
-        if (data) {
-            data.latency.push(ms);
-            if (data.latency.length > 5) data.latency.shift(); // Keep last 5
-            this.updateStats();
-        }
-    }
-
-    // Test a single proxy
     async testSingleProxy(proxy) {
         const [host, port] = proxy.split(':');
         const start = Date.now();
@@ -246,7 +196,6 @@ class ProxyManager {
         });
     }
 
-    // Test all proxies (can be triggered by admin)
     async testAllProxies() {
         if (this.proxies.size === 0) {
             return { total: 0, active: 0, dead: 0 };
@@ -315,7 +264,7 @@ class ProxyManager {
 
 const proxyManager = new ProxyManager();
 
-// ========== SIMPLE SYSTEM MONITOR ==========
+// ========== SYSTEM MONITOR ==========
 class SystemMonitor {
     async getStats() {
         try {
@@ -324,7 +273,6 @@ class SystemMonitor {
             const freeMem = os.freemem();
             const usedMem = totalMem - freeMem;
             
-            // Simple CPU load calculation
             const loadAvg = os.loadavg();
             const cpuCount = cpus.length;
             const cpuPercent = Math.min(100, Math.round((loadAvg[0] / cpuCount) * 100));
@@ -340,7 +288,9 @@ class SystemMonitor {
                 uptime: os.uptime(),
                 hostname: os.hostname(),
                 platform: os.platform(),
-                arch: os.arch()
+                arch: os.arch(),
+                cpus: cpuCount,
+                model: cpus[0]?.model || 'Unknown'
             };
         } catch (err) {
             console.error('Error getting system stats:', err);
@@ -924,7 +874,6 @@ bot.on('document', async (ctx) => {
             const response = await fetch(fileUrl);
             const content = await response.text();
             
-            // Validate and clean proxies
             const proxies = content.split('\n')
                 .map(l => l.trim())
                 .filter(l => l && l.includes(':') && !l.startsWith('#'));
@@ -1052,7 +1001,7 @@ bot.catch((err, ctx) => {
     console.error('\x1b[31m%s\x1b[0m', `[ERROR] ${err.message}`);
 });
 
-// ========== EXPRESS SERVER WITH RED THEME ==========
+// ========== EXPRESS SERVER WITH FULL BOT INTEGRATION ==========
 const app = express();
 const port = process.env.PORT || 3000;
 const HOST = '::';
@@ -1078,10 +1027,15 @@ const isAuthenticated = (req, res, next) => {
     else res.status(401).json({ error: 'Unauthorized' });
 };
 
-// Professional Red Theme CSS (simplified for brevity)
+// Professional Red Theme CSS with full styling
 const redTheme = `
 <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+
     :root {
         --bg-primary: #0a0505;
         --bg-secondary: #1a0a0a;
@@ -1094,29 +1048,384 @@ const redTheme = `
         --border-color: #660000;
         --shadow-color: rgba(255, 0, 0, 0.2);
         --font-mono: 'JetBrains Mono', 'Courier New', monospace;
-        --font-sans: 'Inter', sans-serif;
+        --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     }
-    body { background: var(--bg-primary); color: var(--text-primary); font-family: var(--font-sans); }
-    .container { max-width: 1600px; margin: 0 auto; padding: 2rem; }
-    .header { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; margin-bottom: 2rem; }
-    .header h1::before { content: '>'; color: var(--accent-primary); margin-right: 0.5rem; }
-    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem; margin: 2rem 0; }
-    .stat-card { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; }
-    .stat-value { font-size: 2.5rem; color: var(--accent-primary); font-family: var(--font-mono); }
-    .btn { background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-primary); padding: 0.75rem 1.5rem; cursor: pointer; }
-    .btn:hover { border-color: var(--accent-primary); }
-    .attack-item { background: var(--bg-secondary); border: 1px solid var(--border-color); border-left: 4px solid var(--accent-primary); padding: 1.5rem; margin: 1rem 0; }
-    .progress-bar { height: 8px; background: var(--bg-tertiary); }
-    .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary)); }
+
+    * {
+        scrollbar-width: thin;
+        scrollbar-color: var(--accent-primary) var(--bg-tertiary);
+    }
+
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: var(--bg-tertiary);
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: var(--accent-primary);
+        border-radius: 4px;
+    }
+
+    body {
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        line-height: 1.6;
+        min-height: 100vh;
+        position: relative;
+    }
+
+    body::before {
+        content: '';
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: 
+            radial-gradient(circle at 20% 50%, rgba(255, 0, 0, 0.05) 0%, transparent 50%),
+            radial-gradient(circle at 80% 80%, rgba(255, 0, 0, 0.05) 0%, transparent 50%);
+        pointer-events: none;
+        z-index: 0;
+    }
+
+    .container {
+        max-width: 1600px;
+        margin: 0 auto;
+        padding: 2rem;
+        position: relative;
+        z-index: 1;
+    }
+
+    .header {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 20px var(--shadow-color);
+        border-left: 4px solid var(--accent-primary);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .header h1 {
+        font-family: var(--font-mono);
+        font-size: 2rem;
+        font-weight: 600;
+        color: var(--accent-primary);
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+
+    .header h1::before {
+        content: '>';
+        color: var(--accent-primary);
+        margin-right: 0.5rem;
+        animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0; }
+    }
+
+    .status-badge {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 20px;
+        padding: 0.5rem 1.5rem;
+        color: var(--accent-primary);
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .status-badge::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        background: var(--accent-primary);
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.5; transform: scale(1.2); }
+    }
+
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1.5rem;
+        margin: 2rem 0;
+    }
+
+    .stat-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 1.5rem;
+        transition: all 0.3s ease;
+        border-left: 4px solid var(--accent-primary);
+    }
+
+    .stat-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 30px var(--shadow-color);
+    }
+
+    .stat-value {
+        font-size: 2.5rem;
+        font-weight: 600;
+        color: var(--accent-primary);
+        font-family: var(--font-mono);
+    }
+
+    .stat-label {
+        color: var(--text-muted);
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+
+    .attack-list {
+        margin: 2rem 0;
+    }
+
+    .attack-item {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+        border-left: 4px solid var(--accent-primary);
+    }
+
+    .attack-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-bottom: 1rem;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .attack-id {
+        font-family: var(--font-mono);
+        color: var(--accent-secondary);
+        background: var(--bg-tertiary);
+        padding: 0.25rem 0.75rem;
+        border-radius: 4px;
+        font-size: 0.9rem;
+    }
+
+    .attacker-badge {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--accent-primary);
+        border-radius: 20px;
+        padding: 0.25rem 1rem;
+        font-size: 0.9rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .attacker-badge::before {
+        content: '@';
+        color: var(--accent-primary);
+        font-weight: bold;
+    }
+
+    .attack-timestamp {
+        color: var(--text-muted);
+        font-size: 0.8rem;
+        font-family: var(--font-mono);
+    }
+
+    .attack-target {
+        color: var(--text-secondary);
+        margin-bottom: 1rem;
+        word-break: break-all;
+        font-size: 1.1rem;
+    }
+
+    .progress-bar {
+        width: 100%;
+        height: 8px;
+        background: var(--bg-tertiary);
+        border-radius: 4px;
+        overflow: hidden;
+        margin: 0.5rem 0;
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+        transition: width 0.3s ease;
+    }
+
+    .progress-stats {
+        display: flex;
+        justify-content: space-between;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+    }
+
+    .attack-meta {
+        display: flex;
+        justify-content: space-between;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+        margin-top: 0.5rem;
+    }
+
+    .attack-stats-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 1rem;
+        margin: 1rem 0;
+    }
+
+    .attack-stat {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 0.75rem;
+        text-align: center;
+    }
+
+    .attack-stat-label {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+    }
+
+    .attack-stat-value {
+        color: var(--accent-primary);
+        font-family: var(--font-mono);
+        font-size: 1.2rem;
+        font-weight: bold;
+    }
+
+    .attack-stat-value.success {
+        color: #00ff00;
+    }
+
+    .attack-stat-value.failed {
+        color: #ff0000;
+    }
+
+    .live-indicator {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        background: #00ff00;
+        border-radius: 50%;
+        margin-right: 0.5rem;
+        animation: pulse 1s infinite;
+    }
+
+    .btn {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 0.75rem 1.5rem;
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        text-decoration: none;
+    }
+
+    .btn:hover {
+        border-color: var(--accent-primary);
+        color: var(--accent-primary);
+        transform: translateY(-1px);
+    }
+
+    .btn-primary {
+        background: var(--accent-primary);
+        color: white;
+    }
+
+    .btn-primary:hover {
+        background: var(--accent-secondary);
+        border-color: var(--accent-secondary);
+    }
+
+    .admin-login {
+        background: transparent;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 0.75rem 1.5rem;
+        color: var(--text-primary);
+        text-decoration: none;
+        transition: all 0.3s ease;
+        margin-left: 1rem;
+    }
+
+    .admin-login:hover {
+        border-color: var(--accent-primary);
+        color: var(--accent-primary);
+    }
+
+    .footer {
+        margin-top: 4rem;
+        padding-top: 2rem;
+        border-top: 1px solid var(--border-color);
+        text-align: center;
+        color: var(--text-muted);
+    }
+
+    @media (max-width: 768px) {
+        .stats-grid {
+            grid-template-columns: 1fr;
+        }
+        
+        .header {
+            flex-direction: column;
+            gap: 1rem;
+        }
+        
+        .attack-stats-grid {
+            grid-template-columns: repeat(2, 1fr);
+        }
+        
+        .attack-header {
+            flex-direction: column;
+            align-items: flex-start;
+        }
+    }
 </style>
 `;
 
-// ========== USER PANEL ==========
+// ========== USER PANEL WITH ATTACKER TRACKING ==========
 app.get('/', (req, res) => {
     const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
     const seconds = uptime % 60;
+    
+    const proxyStats = proxyManager.getStats();
+    const runningAttacks = countRunningAttacks();
+    
+    // Sort attacks by start time (newest first)
+    const sortedAttacks = Array.from(attacks.entries())
+        .filter(([_, a]) => a.isRunning)
+        .sort((a, b) => b[1].startTime - a[1].startTime);
     
     res.send(`
         <!DOCTYPE html>
@@ -1132,50 +1441,165 @@ app.get('/', (req, res) => {
             <div class="container">
                 <div class="header">
                     <h1>LIMHACKER Control System</h1>
-                    <div style="float: right;">
-                        <a href="/login" class="btn">ADMIN ACCESS</a>
+                    <div>
+                        <span class="status-badge">SYSTEM ONLINE</span>
+                        <a href="/login" class="admin-login">ADMIN ACCESS</a>
                     </div>
                 </div>
 
                 <div class="stats-grid">
                     <div class="stat-card">
-                        <div class="stat-value">${attacks.size}</div>
-                        <div>Active Attacks</div>
+                        <div class="stat-value">${runningAttacks}</div>
+                        <div class="stat-label">Active Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${formatNumber(metrics.totalRequests)}</div>
-                        <div>Total Requests</div>
+                        <div class="stat-label">Total Requests</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${formatBytes(metrics.totalBytes)}</div>
-                        <div>Bandwidth</div>
+                        <div class="stat-label">Bandwidth Used</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-value">${proxyManager.getStats().active}</div>
-                        <div>Active Proxies</div>
+                        <div class="stat-value">${proxyStats.active}</div>
+                        <div class="stat-label">Active Proxies</div>
                     </div>
                 </div>
 
-                <h2>Active Attacks</h2>
-                ${Array.from(attacks.entries()).map(([id, attack]) => {
-                    const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
-                    const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
-                    return `
-                    <div class="attack-item">
-                        <div>ID: ${id} | @${attack.username}</div>
-                        <div>Target: ${attack.url}</div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: ${percent}%"></div>
-                        </div>
-                        <div>${percent}% | ${elapsed}s / ${attack.duration}s</div>
-                    </div>
-                    `;
-                }).join('')}
+                <h2 style="margin-bottom: 1rem; color: var(--accent-primary); display: flex; align-items: center; gap: 1rem;">
+                    <span>🎯 Active Attacks</span>
+                    <span class="live-indicator"></span>
+                    <span class="attack-timestamp">Last Update: ${new Date().toLocaleTimeString()}</span>
+                </h2>
+                
+                <div class="attack-list">
+                    ${sortedAttacks.length > 0 ? sortedAttacks.map(([id, attack]) => {
+                        const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
+                        const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
+                        const successRate = calculateSuccessRate(attack);
+                        const timeRemaining = attack.duration - elapsed;
+                        
+                        // Format start time
+                        const startTimeStr = new Date(attack.startTime).toLocaleTimeString();
+                        
+                        // Determine status color based on success rate
+                        let statusColor = 'var(--accent-primary)';
+                        let statusText = 'ACTIVE';
+                        if (successRate > 80) {
+                            statusColor = '#00ff00';
+                            statusText = 'STRONG';
+                        } else if (successRate > 50) {
+                            statusColor = '#ffff00';
+                            statusText = 'MODERATE';
+                        } else if (successRate > 20) {
+                            statusColor = '#ff8800';
+                            statusText = 'WEAK';
+                        } else {
+                            statusColor = '#ff0000';
+                            statusText = 'CRITICAL';
+                        }
+                        
+                        return `
+                        <div class="attack-item">
+                            <div class="attack-header">
+                                <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+                                    <span class="attack-id">#${id}</span>
+                                    <span class="attacker-badge">${attack.username}</span>
+                                    <span class="attack-timestamp">
+                                        Started: ${startTimeStr}
+                                    </span>
+                                </div>
+                                <div>
+                                    <span style="color: ${statusColor}; font-weight: bold; padding: 0.25rem 0.75rem; background: var(--bg-tertiary); border-radius: 4px;">
+                                        ${statusText}
+                                    </span>
+                                </div>
+                            </div>
+                            
+                            <div class="attack-target">
+                                🎯 ${attack.url}
+                            </div>
+                            
+                            <div style="background: var(--bg-tertiary); border-radius: 8px; padding: 1rem;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+                                    <span>Progress</span>
+                                    <span>${percent}% Complete</span>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: ${percent}%"></div>
+                                </div>
+                                <div class="attack-meta">
+                                    <span>⏱️ Elapsed: ${elapsed}s</span>
+                                    <span>⏳ Remaining: ${timeRemaining}s</span>
+                                    <span>⚡ Total: ${attack.duration}s</span>
+                                </div>
+                            </div>
 
-                <div style="margin-top: 2rem; text-align: center;">
-                    <button class="btn" onclick="location.reload()">REFRESH</button>
+                            <div class="attack-stats-grid">
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Requests</div>
+                                    <div class="attack-stat-value">${formatNumber(attack.requestCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Success</div>
+                                    <div class="attack-stat-value success">${formatNumber(attack.successCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Failed</div>
+                                    <div class="attack-stat-value failed">${formatNumber(attack.failCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Success Rate</div>
+                                    <div class="attack-stat-value" style="color: ${statusColor};">${successRate}%</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">RPS</div>
+                                    <div class="attack-stat-value">${Math.floor(attack.requestCount / Math.max(1, elapsed))}</div>
+                                </div>
+                            </div>
+
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
+                                <div>
+                                    <span style="color: var(--text-muted);">Pattern:</span>
+                                    <span style="margin-left: 0.5rem; color: var(--accent-primary);">${attack.pattern.toUpperCase()}</span>
+                                </div>
+                                <div>
+                                    <span style="color: var(--text-muted);">Threads:</span>
+                                    <span style="margin-left: 0.5rem; color: var(--accent-primary);">${attack.threads}</span>
+                                </div>
+                                <div>
+                                    <span style="color: var(--text-muted);">Rate:</span>
+                                    <span style="margin-left: 0.5rem; color: var(--accent-primary);">${formatNumber(attack.rate)}/s</span>
+                                </div>
+                            </div>
+                        </div>
+                        `;
+                    }).join('') : `
+                    <div style="text-align: center; padding: 3rem; background: var(--bg-secondary); border-radius: 12px; border: 1px solid var(--border-color);">
+                        <p style="color: var(--text-muted); font-size: 1.2rem;">No active attacks</p>
+                        <p style="color: var(--text-muted); margin-top: 1rem;">Use Telegram bot to launch attacks</p>
+                        <div style="margin-top: 2rem;">
+                            <a href="https://t.me/DDOSATTACK67_BOT" class="btn btn-primary">OPEN TELEGRAM BOT</a>
+                        </div>
+                    </div>
+                    `}
+                </div>
+
+                <div class="footer">
+                    <p>LIMHACKER Control System v4.0 | ${new Date().toLocaleString()}</p>
+                    <p style="margin-top: 1rem;">
+                        <button class="btn" onclick="location.reload()">REFRESH</button>
+                        <a href="https://t.me/DDOSATTACK67_BOT" class="btn" style="margin-left: 1rem;">TELEGRAM BOT</a>
+                    </p>
                 </div>
             </div>
+
+            <script>
+                // Auto-refresh every 5 seconds for real-time updates
+                setTimeout(() => {
+                    location.reload();
+                }, 5000);
+            </script>
         </body>
         </html>
     `);
@@ -1185,21 +1609,115 @@ app.get('/', (req, res) => {
 app.get('/login', (req, res) => {
     res.send(`
         <!DOCTYPE html>
-        <html>
+        <html lang="en">
         <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>LIMHACKER Admin Login</title>
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
             ${redTheme}
+            <style>
+                .login-container {
+                    max-width: 400px;
+                    margin: 100px auto;
+                    background: var(--bg-secondary);
+                    border: 1px solid var(--border-color);
+                    border-radius: 12px;
+                    padding: 2rem;
+                    border-left: 4px solid var(--accent-primary);
+                }
+
+                .login-header {
+                    text-align: center;
+                    margin-bottom: 2rem;
+                }
+
+                .login-header h1 {
+                    font-family: var(--font-mono);
+                    color: var(--accent-primary);
+                }
+
+                .form-group {
+                    margin-bottom: 1.5rem;
+                }
+
+                .form-group input {
+                    width: 100%;
+                    padding: 0.75rem;
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: 8px;
+                    color: var(--text-primary);
+                    font-family: var(--font-mono);
+                    font-size: 1rem;
+                }
+
+                .form-group input:focus {
+                    outline: none;
+                    border-color: var(--accent-primary);
+                }
+
+                .login-btn {
+                    width: 100%;
+                    padding: 0.75rem;
+                    background: var(--accent-primary);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1rem;
+                    cursor: pointer;
+                }
+
+                .login-btn:hover {
+                    background: var(--accent-secondary);
+                }
+
+                .error-message {
+                    background: rgba(255, 0, 0, 0.1);
+                    border: 1px solid var(--accent-danger);
+                    border-radius: 8px;
+                    padding: 1rem;
+                    margin-bottom: 1rem;
+                    color: var(--accent-danger);
+                    text-align: center;
+                }
+
+                .back-link {
+                    text-align: center;
+                    margin-top: 1.5rem;
+                }
+
+                .back-link a {
+                    color: var(--text-muted);
+                    text-decoration: none;
+                }
+
+                .back-link a:hover {
+                    color: var(--accent-primary);
+                }
+            </style>
         </head>
         <body>
-            <div style="max-width: 400px; margin: 100px auto; background: var(--bg-secondary); padding: 2rem; border-left: 4px solid var(--accent-primary);">
-                <h1>LIMHACKER ADMIN</h1>
-                ${req.query.error ? '<p style="color: var(--accent-danger);">Invalid credentials</p>' : ''}
-                <form method="POST" action="/login">
-                    <input type="password" name="password" placeholder="Password" style="width: 100%; padding: 0.75rem; margin: 1rem 0; background: var(--bg-tertiary); border: 1px solid var(--border-color); color: var(--text-primary);">
-                    <button type="submit" style="width: 100%; padding: 0.75rem; background: var(--accent-primary); color: white; border: none; cursor: pointer;">LOGIN</button>
-                </form>
-                <a href="/" style="display: block; text-align: center; margin-top: 1rem; color: var(--text-muted);">← Back</a>
+            <div class="container">
+                <div class="login-container">
+                    <div class="login-header">
+                        <h1>LIMHACKER ADMIN</h1>
+                        <p style="color: var(--text-muted);">Enter your credentials</p>
+                    </div>
+
+                    ${req.query.error ? '<div class="error-message">Invalid credentials</div>' : ''}
+
+                    <form method="POST" action="/login">
+                        <div class="form-group">
+                            <input type="password" name="password" placeholder="Password" required autofocus>
+                        </div>
+                        <button type="submit" class="login-btn">AUTHENTICATE</button>
+                    </form>
+
+                    <div class="back-link">
+                        <a href="/">← Return to monitor</a>
+                    </div>
+                </div>
             </div>
         </body>
         </html>
@@ -1222,48 +1740,246 @@ app.get('/admin', isAuthenticated, (req, res) => {
     const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
+    const sessionTime = Math.floor((Date.now() - req.session.loginTime) / 1000);
+    const sessionHours = Math.floor(sessionTime / 3600);
+    const sessionMinutes = Math.floor((sessionTime % 3600) / 60);
+    const sessionSeconds = sessionTime % 60;
+    
+    const proxyStats = proxyManager.getStats();
+    const runningAttacks = countRunningAttacks();
+    
+    // Sort attacks by start time (newest first)
+    const sortedAttacks = Array.from(attacks.entries())
+        .filter(([_, a]) => a.isRunning)
+        .sort((a, b) => b[1].startTime - a[1].startTime);
     
     res.send(`
         <!DOCTYPE html>
-        <html>
+        <html lang="en">
         <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>LIMHACKER Admin Panel</title>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
             ${redTheme}
+            <style>
+                .admin-grid {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 1.5rem;
+                    margin: 2rem 0;
+                }
+
+                .admin-panel {
+                    background: var(--bg-secondary);
+                    border: 1px solid var(--border-color);
+                    border-radius: 12px;
+                    padding: 1.5rem;
+                    border-left: 4px solid var(--accent-primary);
+                }
+
+                .panel-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 1rem;
+                    padding-bottom: 1rem;
+                    border-bottom: 1px solid var(--border-color);
+                }
+
+                .session-info {
+                    background: var(--bg-tertiary);
+                    border: 1px solid var(--border-color);
+                    border-radius: 8px;
+                    padding: 1rem;
+                    margin-top: 1rem;
+                }
+
+                .session-info p {
+                    color: var(--text-secondary);
+                    margin: 0.25rem 0;
+                }
+
+                .command-list {
+                    list-style: none;
+                    padding: 0;
+                }
+
+                .command-list li {
+                    padding: 0.5rem;
+                    border-bottom: 1px solid var(--border-color);
+                    font-family: var(--font-mono);
+                    font-size: 0.9rem;
+                    color: var(--text-secondary);
+                }
+
+                .command-list li:last-child {
+                    border-bottom: none;
+                }
+            </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
                     <h1>LIMHACKER Admin Panel</h1>
-                    <div style="float: right;">
+                    <div>
+                        <span class="status-badge">ADMIN: ${req.sessionID.slice(0, 8)}</span>
                         <a href="/" class="btn">USER VIEW</a>
-                        <a href="/logout" class="btn">LOGOUT</a>
+                        <a href="/logout" class="btn" style="border-color: var(--accent-danger);">LOGOUT</a>
                     </div>
                 </div>
 
                 <div class="stats-grid">
                     <div class="stat-card">
-                        <div class="stat-value">${attacks.size}</div>
-                        <div>Active Attacks</div>
+                        <div class="stat-value">${runningAttacks}</div>
+                        <div class="stat-label">Active Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${metrics.totalAttacks}</div>
-                        <div>Total Attacks</div>
+                        <div class="stat-label">Total Attacks</div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-value">${templates.size}</div>
-                        <div>Templates</div>
+                        <div class="stat-label">Templates</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-value">${proxyManager.getStats().active}</div>
-                        <div>Active Proxies</div>
+                        <div class="stat-value">${proxyStats.active}</div>
+                        <div class="stat-label">Active Proxies</div>
                     </div>
                 </div>
 
-                <div style="background: var(--bg-secondary); padding: 1.5rem; margin: 1rem 0;">
-                    <h3>System Info</h3>
-                    <p>Uptime: ${hours}h ${minutes}m</p>
-                    <p>Memory: ${formatBytes(process.memoryUsage().rss)}</p>
+                <div class="admin-grid">
+                    <div class="admin-panel">
+                        <div class="panel-header">
+                            <h3>System Information</h3>
+                        </div>
+                        <div>
+                            <p><strong>Uptime:</strong> ${hours}h ${minutes}m</p>
+                            <p><strong>Memory:</strong> ${formatBytes(process.memoryUsage().rss)}</p>
+                            <p><strong>CPU Cores:</strong> ${os.cpus().length}</p>
+                            <p><strong>Platform:</strong> ${os.platform()} ${os.arch()}</p>
+                            <p><strong>Hostname:</strong> ${os.hostname()}</p>
+                        </div>
+                    </div>
+
+                    <div class="admin-panel">
+                        <div class="panel-header">
+                            <h3>Session Info</h3>
+                        </div>
+                        <div class="session-info">
+                            <p>Session ID: ${req.sessionID.slice(0, 12)}...</p>
+                            <p>Duration: ${sessionHours}h ${sessionMinutes}m ${sessionSeconds}s</p>
+                            <p>Total Commands: ${commandHistory.length}</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin: 2rem 0;">
+                    <h3 style="color: var(--accent-primary); margin-bottom: 1rem;">Recent Commands</h3>
+                    <div class="admin-panel">
+                        <ul class="command-list">
+                            ${commandHistory.slice(-10).map(cmd => `<li>> ${cmd}</li>`).join('')}
+                            ${commandHistory.length === 0 ? '<li style="color: var(--text-muted);">No commands executed yet</li>' : ''}
+                        </ul>
+                    </div>
+                </div>
+
+                <h2 style="margin: 2rem 0 1rem; color: var(--accent-primary); display: flex; align-items: center; gap: 1rem;">
+                    <span>🎯 Active Attacks</span>
+                    <span class="live-indicator"></span>
+                </h2>
+                <div class="attack-list">
+                    ${sortedAttacks.length > 0 ? sortedAttacks.map(([id, attack]) => {
+                        const elapsed = Math.floor((Date.now() - attack.startTime) / 1000);
+                        const percent = Math.min(100, Math.floor((elapsed / attack.duration) * 100));
+                        const successRate = calculateSuccessRate(attack);
+                        const timeRemaining = attack.duration - elapsed;
+                        
+                        const startTimeStr = new Date(attack.startTime).toLocaleTimeString();
+                        
+                        let statusColor = 'var(--accent-primary)';
+                        let statusText = 'ACTIVE';
+                        if (successRate > 80) {
+                            statusColor = '#00ff00';
+                            statusText = 'STRONG';
+                        } else if (successRate > 50) {
+                            statusColor = '#ffff00';
+                            statusText = 'MODERATE';
+                        } else if (successRate > 20) {
+                            statusColor = '#ff8800';
+                            statusText = 'WEAK';
+                        } else {
+                            statusColor = '#ff0000';
+                            statusText = 'CRITICAL';
+                        }
+                        
+                        return `
+                        <div class="attack-item">
+                            <div class="attack-header">
+                                <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+                                    <span class="attack-id">#${id}</span>
+                                    <span class="attacker-badge">${attack.username}</span>
+                                    <span class="attack-timestamp">Started: ${startTimeStr}</span>
+                                </div>
+                                <div>
+                                    <span style="color: ${statusColor}; font-weight: bold; padding: 0.25rem 0.75rem; background: var(--bg-tertiary); border-radius: 4px;">
+                                        ${statusText}
+                                    </span>
+                                </div>
+                            </div>
+                            
+                            <div class="attack-target">🎯 ${attack.url}</div>
+                            
+                            <div style="background: var(--bg-tertiary); padding: 1rem; border-radius: 8px;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+                                    <span>Progress</span>
+                                    <span>${percent}% Complete</span>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: ${percent}%"></div>
+                                </div>
+                                <div class="attack-meta">
+                                    <span>⏱️ Elapsed: ${elapsed}s</span>
+                                    <span>⏳ Remaining: ${timeRemaining}s</span>
+                                    <span>⚡ Total: ${attack.duration}s</span>
+                                </div>
+                            </div>
+
+                            <div class="attack-stats-grid">
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Requests</div>
+                                    <div class="attack-stat-value">${formatNumber(attack.requestCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Success</div>
+                                    <div class="attack-stat-value success">${formatNumber(attack.successCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Failed</div>
+                                    <div class="attack-stat-value failed">${formatNumber(attack.failCount)}</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">Success Rate</div>
+                                    <div class="attack-stat-value" style="color: ${statusColor};">${successRate}%</div>
+                                </div>
+                                <div class="attack-stat">
+                                    <div class="attack-stat-label">RPS</div>
+                                    <div class="attack-stat-value">${Math.floor(attack.requestCount / Math.max(1, elapsed))}</div>
+                                </div>
+                            </div>
+
+                            <div style="display: flex; justify-content: space-between; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
+                                <span><span style="color: var(--text-muted);">Pattern:</span> ${attack.pattern.toUpperCase()}</span>
+                                <span><span style="color: var(--text-muted);">Threads:</span> ${attack.threads}</span>
+                                <span><span style="color: var(--text-muted);">Rate:</span> ${formatNumber(attack.rate)}/s</span>
+                            </div>
+                        </div>
+                        `;
+                    }).join('') : '<p style="color: var(--text-muted); text-align: center;">No active attacks</p>'}
+                </div>
+
+                <div class="footer">
+                    <p>LIMHACKER Admin Panel | ${new Date().toLocaleString()}</p>
                 </div>
             </div>
         </body>
@@ -1276,36 +1992,38 @@ app.get('/logout', (req, res) => {
     res.redirect('/');
 });
 
-// ========== API ENDPOINTS ==========
-app.post('/api/command', isAuthenticated, async (req, res) => {
-    const { command } = req.body;
-    commandHistory.push(command);
-    
-    try {
-        const parts = command.split(' ');
-        const cmd = parts[0].toLowerCase();
-        let output = '';
+// ========== API ENDPOINTS FOR WEB INTERFACE ==========
+app.get('/api/stats', (req, res) => {
+    res.json({
+        attacks: attacks.size,
+        totalAttacks: metrics.totalAttacks,
+        totalRequests: metrics.totalRequests,
+        totalBytes: metrics.totalBytes,
+        peakRPS: metrics.peakRPS,
+        proxyStats: proxyManager.getStats(),
+        uptime: process.uptime()
+    });
+});
 
-        switch(cmd) {
-            case '/attack':
-                output = 'Attack sequence initiated (use Telegram for actual attacks)';
-                break;
-            case '/stop':
-                output = 'Attack stopped';
-                break;
-            case '/stats':
-                output = `Active: ${attacks.size}, Total Attacks: ${metrics.totalAttacks}`;
-                break;
-            case '/proxies':
-                output = `Active Proxies: ${proxyManager.getStats().active}`;
-                break;
-            default:
-                output = 'Command received (use Telegram for full functionality)';
-        }
-        res.json({ output });
-    } catch (err) {
-        res.json({ output: `Error: ${err.message}` });
-    }
+app.get('/api/attacks', (req, res) => {
+    const attackList = Array.from(attacks.entries()).map(([id, a]) => ({
+        id,
+        url: a.url,
+        elapsed: Math.floor((Date.now() - a.startTime) / 1000),
+        duration: a.duration,
+        requests: a.requestCount,
+        success: a.successCount,
+        fail: a.failCount,
+        successRate: calculateSuccessRate(a),
+        username: a.username,
+        pattern: a.pattern,
+        isRunning: a.isRunning
+    }));
+    res.json(attackList);
+});
+
+app.get('/api/proxies', isAuthenticated, (req, res) => {
+    res.json(proxyManager.getProxyList(50));
 });
 
 // ========== START SERVER ==========
